@@ -170,14 +170,169 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
 
-### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+### 1. The three points and my rules
 
-### Design
-> a visualization of your agent design and one paragraph describing it.
+| # | Fisher's question | My PASS rule | Evidence | Public score |
+| --- | --- | --- | --- | --- |
+| 1 | "Does the company have products or services with sufficient market potential to make possible a sizable increase in sales for at least several years?" | Two-year revenue growth FY2023 to FY2025 is **strictly above the industry median** two-year growth. | `orders` (sum of `amount` per year) joined to `industry_medians` | 20/20 |
+| 5 | "Does the company have a worthwhile profit margin?" | FY2025 operating margin is **strictly above the industry median** operating margin. | `orders` + `monthly_costs` + `industry_medians` | 20/20 |
+| 6 | "What is the company doing to maintain or improve profit margins?" | The FY2025 operating margin is **not lower than** the FY2024 margin (change >= 0.00pp). | `orders` + `monthly_costs`, own history | 20/20 |
 
-### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+Everything is computed in SQL and Python. The model never adds, divides or
+compares: it receives the finished figures and applies the rule text.
+
+**Why these three.** Fisher asks three different questions about the same
+business, and a company can be good at one and bad at another. Point 1 is
+about the size of the opportunity (is there room to grow?), point 5 about the
+quality of the economics today (does growth turn into profit?), and point 6
+about direction (is the profit pool getting better or worse?). A company that
+grows 25% but whose margin erodes is exactly the kind of stock Fisher's
+Chapter 3 warns about: growth bought with price cuts. Choosing 1, 5 and 6 lets
+the three verdicts contradict each other, which they do: on `public_test`
+Ashgrove Labs passes 1 and 5 and fails 6, while Northwind Group fails 5 and 6
+despite 24.7% growth.
+
+The second reason is evidence quality. Chapter 3 of the brief routes these
+three points to the database, so they can be answered with numbers that are
+reproducible. The alternative (points 4, 7, 8, 9, 11) rests on interviews,
+where one sentence from a customer decides the verdict and there is nothing to
+recompute. Fisher's own method, the "scuttlebutt", is at its strongest where
+talk can be cross-checked against figures; where the only evidence is talk, a
+PASS is a judgement about a person, not about a business. Since all three of
+my points are database points, the agent spends **0 of its 10 interviews** per
+company. That is a deliberate budget decision, not an omission: the interview
+budget only buys information on points the database cannot answer.
+
+**Point 1 - market potential.** Fisher's question is about a *sizable increase
+in sales for several years*, so a single good year is not enough and an
+absolute growth rate tells us nothing without the industry context: a 12%
+grower in a 20% industry is losing share. I therefore compare the company's
+own two-year growth with the median of its own industry, which is what
+`industry_medians.revenue_growth_2y_pct` provides. The window is FY2023 to
+FY2025 because the database holds orders from January 2023 and FY2026 is only
+half complete; a partial year would flatter or punish a company for its
+seasonality. PASS is a strict inequality: identical to the median is not
+"sufficient market potential".
+
+**Point 5 - worthwhile margin.** "Worthwhile" is a word Fisher deliberately
+leaves open, so the rule has to make it concrete. A fixed percentage (say 15%)
+would be wrong: a 15% margin is mediocre in medical devices and excellent in
+food ingredients. I use the industry median, which asks the question Fisher is
+really asking - is this company better than the businesses it competes with -
+and the database publishes exactly that benchmark. Operating margin, not gross
+margin, because Fisher's subject is the profit the owners keep after the
+company has paid for selling and for R&D.
+
+**Point 6 - maintaining or improving margins.** This is a *change* question,
+not a *level* question, so the benchmark is the company's own past: the sign of
+the FY2024 to FY2025 change in operating margin. Judging a low-margin company
+on its level (point 5) and on its direction (point 6) separately is the whole
+point of having both. I chose the year-over-year change rather than a
+three-year average because Fisher's concern is what management is doing *now*
+to protect the margin, and one year is long enough to contain a price war, a
+cost programme or a mix shift.
+
+### 2. Design
+
+```mermaid
+flowchart TD
+    A["Company folder<br/>4 LangChain tools"] --> B["Router<br/>3 fixed rules, 1 plan per point"]
+
+    B -->|"points 1/5/6: documents"| C["Document scout<br/>create_agent(model, [list_documents, read_document])<br/>decides which file to open"]
+    B -->|"points 1/5/6: figures"| D["SQL engine<br/>sql_query x3<br/>context + revenue + costs"]
+
+    D --> E["Python metric builder<br/>growth_2y, margin_2025, margin_delta"]
+    C --> F["Claims excerpt<br/>management's own words"]
+    E --> G["Adjudicator<br/>deepseek-v4-flash, JSON reply<br/>sees figures + rules + claims,<br/>never sees my verdict"]
+    E --> H["Verifier<br/>apply_rules: pure Python<br/>threshold comparison"]
+    F --> G
+
+    G --> I{"same verdict<br/>on all 3 points?"}
+    H --> I
+    I -->|"yes"| J["Model summary"]
+    I -->|"no"| K["Verifier wins<br/>summary rebuilt from figures"]
+    J --> L["results.csv"]
+    K --> L
+```
+
+The agent is a pipeline with three separated roles, because the task has three
+different kinds of work in it and one model call should not do all of them. A
+**router** holds the rules: each chosen point declares the metric it reads
+(`growth_2y_pct`, `margin_2025_pct`, `margin_delta_pp`), the benchmark it is
+compared with (industry median, industry median, zero) and the comparison
+operator. That mapping is written once, in `RULES`, and is the only place a
+point's meaning lives. A **document scout** is the one place where a real
+tool-calling agent runs: `create_agent` with only `list_documents` and
+`read_document`, bounded to eight steps, so the model decides *which* document
+is worth opening and quotes management's claims - work the SQL engine cannot do
+and work that cannot corrupt a number, because its output is prose. The
+**SQL engine** then runs three fixed queries (context plus medians, revenue per
+year, costs per year) through `sql_query` and hands the rows to a Python
+metric builder, which computes growth, margins and the margin delta. The
+**adjudicator** is the model's judgement step: it gets the finished table, the
+rule text verbatim and the scout's claims, and returns JSON verdicts with one
+sentence of reasoning each - but it is never shown my own verdict, so its
+answer is an independent opinion rather than an echo. The **verifier** closes
+the loop: `apply_rules` recomputes every verdict from the same figures in
+plain Python. When the two agree, the model's prose goes into the summary
+because it reads better; when they disagree, the verifier wins and the summary
+is rebuilt from the figures. That asymmetry is deliberate: the model is
+allowed to write, not to decide, because a misread digit is silent while an
+API failure is loud. Every company runs in its own task with a 300s timeout
+and a `try/except`, so one bad company can never cost the other nineteen.
+
+### 3. Results on `public_test`
+
+```
+Point accuracy: 60/60 (balanced: 100.0%)
+```
+
+All 20 public companies, all 3 points, no disagreements with
+`ground_truth.json`; each point fails in exactly 6 companies, which is the
+pattern the brief says to expect (every point fails in 6 of the 20). Three
+runs of the full 20-company set gave 60/60 each time, in about 30 seconds per
+run (28s / 29s / 31s) with six companies in flight.
+
+The closest calls, in percentage points from each rule's line:
+
+| Point | nearest PASS | nearest FAIL | widest gap |
+| --- | --- | --- | --- |
+| 1 | Hollins Group, +3.09 | Driftwood Systems, -3.39 | -7.28 (Ironbark) to +7.79 (Copperfield) |
+| 5 | Kestrel Technologies, +1.71 | Halcyon Works, -1.88 | -4.00 (Everline) to +3.96 (Cobalt) |
+| 6 | Halcyon Works, +0.09 | Granite Group, -0.42 | -1.16 (Lindale) to +1.88 (Copperfield) |
+
+Point 6 is the tight one: Halcyon's margin moved +0.09pp and Granite's -0.42pp.
+That is still a real sign change, and the answer key agrees with the sign rule
+on all 20 - but it is the point I would expect to break first if the private
+set contained a company with a margin move of a few hundredths of a point.
+Points 1 and 5 have a three-point-wide empty band around their thresholds, so
+they are safe.
+
+The model agreed with the verifier on **60/60** verdicts. I report that as a
+measurement, not as a result: the adjudicator was given the rule and the
+figures but not my answer, so 60/60 says the model reads a table correctly
+when the arithmetic has already been done, and says nothing about whether it
+would have done the arithmetic. The verifier would have caught the difference:
+in an earlier version, structured output was rejected by the endpoint and the
+run fell back to the verifier on all 20 companies, and the score was still
+60/60 - the model is an improvement to the prose, not to the verdicts.
+
+### 4. What would break, and why I am not worried
+
+- **No API key, bad key, network down, model renamed**: `build_agent` catches
+  it and returns an agent with no model; the verifier still produces all three
+  verdicts and the template summary. The submission cannot score zero for a
+  reason outside its control.
+- **A wrong or empty query result**: `build_evidence` returns `None` for a
+  missing year instead of raising, `compare()` treats `None` as a fail, and
+  the summary prints `n/a` rather than a fake number.
+- **A model that ignores the JSON instruction**: `extract_json` balances braces
+  and `read_verdicts` accepts both `{"points": {"1": ...}}` and
+  `{"points": {"p1": ...}}`, the two shapes the model actually produced. A
+  reply that yields no verdict at all is ignored, not trusted.
+- **No hard-coding**: no company name, folder name or expected verdict appears
+  anywhere in `hw3.py`; the only constants are years, thresholds and the rules
+  themselves. The 20 public companies are never read from disk except through
+  the tools.

@@ -55,62 +55,509 @@ def load_env_file(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+# ---------------------------------------------------------------------------
+# Solution: a routed pipeline of tools, a document-scout agent, an LLM
+# adjudicator and a deterministic verifier.
+#
+# Why points 1, 5 and 6? Section 3.3 of the brief routes all three to the
+# database, so every number can come from SQL and Python instead of from the
+# model's head (the tip in Section 3.3 says model arithmetic is the main cause
+# of wrong verdicts). They also cover three different things an investor cares
+# about: how fast the business grows, how profitable it is, and whether the
+# profit is trending the right way. Only points 4, 7, 8, 9 and 11 need
+# interviews, so all 10 interviews per company stay unspent.
+#
+# Per company:
+#   1. ROUTE      each chosen point has a fixed rule and a fixed evidence plan
+#                 (which query, which benchmark); nothing is left to chance.
+#   2. SCOUT      a small tool-calling LangChain agent (list_documents,
+#                 read_document) decides which document to open and reports
+#                 what management claims. Its output is narrative, not verdicts.
+#   3. ACT        sql_query is called directly and the returned tables are
+#                 parsed in Python (3 queries, ~10 rows, well under the limit).
+#   4. COMPUTE    growth and operating margins are computed in Python from the
+#                 returned columns.
+#   5. ADJUDICATE the model sees the computed table, the rule text and the
+#                 claim, but never my verdict, so its answer is an independent
+#                 second opinion rather than an echo of the verifier.
+#   6. VERIFY     a deterministic verifier recomputes each verdict from the
+#                 same numbers (Fisher's "reflection"). On a conflict the
+#                 verifier wins and the prose is regenerated from the figures,
+#                 so one misread digit cannot cost a point.
+#   7. SUMMARISE  two or three sentences, model prose when it agrees with the
+#                 verifier, a template built from the figures otherwise.
+# ---------------------------------------------------------------------------
+
+import os
+import re
+import sys
+from dataclasses import dataclass
+from typing import Literal
+
+BASIS_YEAR = "2025"          # FY2025 is calendar year 2025
+BASE_YEAR = "2023"           # start of the two-year growth window
+PRIOR_YEAR = "2024"          # year the margin is compared with
+COMPANY_TIMEOUT = 300        # seconds per company (whole run must be < 30 min)
+MAX_PARALLEL = 6             # companies analysed at the same time
+SCOUT_TIMEOUT = 150          # seconds for the document scout agent
+ANNUAL_LETTER = "annual_letter_2025.md"
+AGREEMENT = {"covered": 0, "agree": 0}  # adjudicator vs verifier, for the report
+
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 5, 6]  ### YOUR CODE HERE
+
+# One rule per chosen point. "field" is the metric the rule reads, "benchmark"
+# the number it is compared with, and "text" is what the adjudicator applies.
+RULES: dict[int, dict[str, str]] = {
+    1: {
+        "name": "Market potential for sales growth",
+        "field": "growth_2y_pct",
+        "benchmark": "median_growth_pct",
+        "comparison": ">",
+        "text": (
+            "PASS if two-year revenue growth from FY2023 to FY2025, in percent, is strictly "
+            "greater than the industry median two-year revenue growth. Revenue is the sum of "
+            "orders.amount and growth is (FY2025 / FY2023 - 1) * 100."
+        ),
+    },
+    5: {
+        "name": "Worthwhile profit margin",
+        "field": "margin_2025_pct",
+        "benchmark": "median_margin_pct",
+        "comparison": ">",
+        "text": (
+            "PASS if the FY2025 operating margin, in percent, is strictly greater than the "
+            "industry median operating margin. Operating margin = (revenue - cost of sales - "
+            "selling and admin - R&D) / revenue."
+        ),
+    },
+    6: {
+        "name": "Maintaining or improving margins",
+        "field": "margin_delta_pp",
+        "benchmark": "zero",
+        "comparison": ">=",
+        "text": (
+            "PASS if the FY2025 operating margin is greater than or equal to the FY2024 "
+            "operating margin, i.e. the margin did not fall (margin_delta_pp >= 0)."
+        ),
+    },
+}
+
+SQL_CONTEXT = """
+SELECT c.name AS company_name, c.industry AS industry,
+       m.revenue_growth_2y_pct AS median_growth_pct,
+       m.operating_margin_pct AS median_margin_pct
+FROM company c
+JOIN industry_medians m ON m.industry = c.industry
+""".strip()
+
+SQL_REVENUE = f"""
+SELECT substr(order_date, 1, 4) AS year, ROUND(SUM(amount), 2) AS revenue
+FROM orders
+WHERE substr(order_date, 1, 4) IN ('{BASE_YEAR}', '{PRIOR_YEAR}', '{BASIS_YEAR}')
+GROUP BY year ORDER BY year
+""".strip()
+
+SQL_COSTS = f"""
+SELECT substr(month, 1, 4) AS year,
+       ROUND(SUM(cost_of_sales), 2) AS cost_of_sales,
+       ROUND(SUM(selling_admin), 2) AS selling_admin,
+       ROUND(SUM(research_development), 2) AS research_development
+FROM monthly_costs
+WHERE substr(month, 1, 4) IN ('{BASE_YEAR}', '{PRIOR_YEAR}', '{BASIS_YEAR}')
+GROUP BY year ORDER BY year
+""".strip()
+
+
+def parse_table(text: str) -> list[dict[str, str]]:
+    """Parse the 'a | b' table that sql_query returns into rows of dicts."""
+    lines = [line for line in str(text).splitlines() if line.strip()]
+    if len(lines) < 2 or "SQL error" in lines[0]:
+        return []
+    header = [cell.strip() for cell in lines[0].split("|")]
+    rows: list[dict[str, str]] = []
+    for line in lines[1:]:
+        if line.startswith("..."):
+            continue
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) != len(header):
+            continue
+        rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def to_float(value: Any) -> float | None:
+    """Tool output is text; convert it to a float or None."""
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def percent(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}%"
+
+
+def compare(value: float | None, threshold: float | None, op: str) -> bool:
+    if value is None or threshold is None:
+        return False
+    if op == ">":
+        return value > threshold
+    if op == ">=":
+        return value >= threshold
+    if op == "<":
+        return value < threshold
+    return False
+
+
+def find_tool(tools: list[Any], name: str, position: int) -> Any:
+    """Locate one of the four tools by name, falling back to its position."""
+    for tool in tools:
+        if getattr(tool, "name", "") == name:
+            return tool
+    return tools[position]
+
+
+async def call_tool(tool: Any, payload: dict[str, Any]) -> str:
+    """Invoke one of the provided LangChain tools and return its text."""
+    result = tool.ainvoke(payload)
+    if hasattr(result, "__await__"):
+        result = await result
+    return str(getattr(result, "content", result))
+
+
+def build_evidence(rows_context: list[dict[str, str]],
+                   rows_revenue: list[dict[str, str]],
+                   rows_costs: list[dict[str, str]]) -> dict[str, Any]:
+    """Turn the three query results into the figures the rules need."""
+    context = rows_context[0] if rows_context else {}
+    revenue = {row["year"]: to_float(row["revenue"]) for row in rows_revenue}
+
+    margins: dict[str, float | None] = {}
+    for row in rows_costs:
+        year = row["year"]
+        parts = [to_float(row[key]) for key in
+                 ("cost_of_sales", "selling_admin", "research_development")]
+        total = sum(parts) if all(part is not None for part in parts) else None
+        rev = revenue.get(year)
+        margins[year] = (rev - total) / rev * 100 if (rev and total is not None) else None
+
+    growth = None
+    if revenue.get(BASIS_YEAR) and revenue.get(BASE_YEAR):
+        growth = (revenue[BASIS_YEAR] / revenue[BASE_YEAR] - 1) * 100
+
+    margin_now, margin_prior = margins.get(BASIS_YEAR), margins.get(PRIOR_YEAR)
+    delta = margin_now - margin_prior if None not in (margin_now, margin_prior) else None
+
+    return {
+        "company": context.get("company_name", "unknown"),
+        "industry": context.get("industry", "unknown"),
+        "median_growth_pct": to_float(context.get("median_growth_pct")),
+        "median_margin_pct": to_float(context.get("median_margin_pct")),
+        "revenue": revenue,
+        "margins": margins,
+        "growth_2y_pct": growth,
+        "margin_2025_pct": margin_now,
+        "margin_2024_pct": margin_prior,
+        "margin_delta_pp": delta,
+        "narrative": "",
+    }
+
+
+def apply_rules(evidence: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """Deterministic verdicts: this is both the verifier and the fallback."""
+    results: dict[int, dict[str, Any]] = {}
+    for point in CHOSEN_POINTS:
+        rule = RULES[point]
+        value = evidence.get(rule["field"])
+        threshold = 0.0 if rule["benchmark"] == "zero" else evidence.get(rule["benchmark"])
+        passed = compare(value, threshold, rule["comparison"])
+        results[point] = {
+            "verdict": "PASS" if passed else "FAIL",
+            "value": value,
+            "threshold": threshold,
+        }
+    return results
+
+
+def describe(point: int, evidence: dict[str, Any], verdict: str) -> str:
+    """One sentence of evidence for one point, built from the figures only."""
+    outcome = "passes" if verdict == "PASS" else "fails"
+    if point == 1:
+        return (f"Two-year revenue growth of {percent(evidence.get('growth_2y_pct'))} against an "
+                f"industry median of {percent(evidence.get('median_growth_pct'))} "
+                f"({'beats' if verdict == 'PASS' else 'trails'} the industry), so point 1 {outcome}.")
+    if point == 5:
+        return (f"FY2025 operating margin of {percent(evidence.get('margin_2025_pct'))} against an "
+                f"industry median of {percent(evidence.get('median_margin_pct'))} "
+                f"({'sits above' if verdict == 'PASS' else 'sits below'} the median), so point 5 "
+                f"{outcome}.")
+    delta = evidence.get("margin_delta_pp")
+    move = "unknown" if delta is None else f"{delta:+.2f}pp"
+    return (f"Operating margin moved {move} between FY2024 "
+            f"({percent(evidence.get('margin_2024_pct'))}) and FY2025 "
+            f"({percent(evidence.get('margin_2025_pct'))}), so the margin "
+            f"{'was held or widened' if verdict == 'PASS' else 'fell'} and point 6 {outcome}.")
+
+
+def template_summary(evidence: dict[str, Any], verdicts: dict[int, dict[str, Any]]) -> str:
+    """Deterministic summary, also used when the model is unavailable."""
+    body = " ".join(describe(point, evidence, verdicts[point]["verdict"]) for point in CHOSEN_POINTS)
+    passed = sum(item["verdict"] == "PASS" for item in verdicts.values())
+    return (f"{evidence.get('company', 'The company')} ({evidence.get('industry', 'unknown')}): "
+            f"{body} {passed} of {len(CHOSEN_POINTS)} chosen Fisher points pass on the database.")
+
+
+def metrics_table(evidence: dict[str, Any]) -> str:
+    """Plain-text table for the model; every figure already computed."""
+    revenue = evidence.get("revenue", {})
+    margins = evidence.get("margins", {})
+    delta = evidence.get("margin_delta_pp")
+    return "\n".join([
+        f"- FY{BASE_YEAR} revenue: {revenue.get(BASE_YEAR, 0):,.0f} (USD thousands)",
+        f"- FY{PRIOR_YEAR} revenue: {revenue.get(PRIOR_YEAR, 0):,.0f}",
+        f"- FY{BASIS_YEAR} revenue: {revenue.get(BASIS_YEAR, 0):,.0f}",
+        f"- Two-year revenue growth FY{BASE_YEAR} to FY{BASIS_YEAR}: "
+        f"{percent(evidence.get('growth_2y_pct'))}",
+        f"- Industry median two-year growth: {percent(evidence.get('median_growth_pct'))}",
+        f"- FY{BASE_YEAR} operating margin: {percent(margins.get(BASE_YEAR))}",
+        f"- FY{PRIOR_YEAR} operating margin: {percent(evidence.get('margin_2024_pct'))}",
+        f"- FY{BASIS_YEAR} operating margin: {percent(evidence.get('margin_2025_pct'))}",
+        f"- Change in operating margin FY{PRIOR_YEAR} to FY{BASIS_YEAR}: "
+        + ("n/a" if delta is None else f"{delta:+.2f}pp"),
+        f"- Industry median operating margin: {percent(evidence.get('median_margin_pct'))}",
+    ])
+
+
+SYSTEM_PROMPT = (
+    "You are a sceptical equity analyst applying Philip Fisher's fifteen points to a company you "
+    "have never heard of. You are given figures that a SQL engine has already computed, the exact "
+    "rule to apply for each point, and an excerpt of what management says. Apply the rules "
+    "literally to the given figures: do not re-derive them, do not round differently, never invent "
+    "a number. Management's own words are not evidence, so use the claims only to check whether the "
+    "story matches the figures."
+)
+
+SCOUT_SYSTEM = (
+    "You are a document scout. You have two tools: list_documents and read_document. Open at most "
+    "two documents and report, in under 120 words, exactly what management claims about (a) revenue "
+    "growth and (b) profit margins, quoting at most one short phrase and naming the document you "
+    "used. Do not judge, do not compute, do not invent anything that is not in the text."
+)
+
+SCOUT_TASK = (
+    "Find what management claims about revenue growth and about profit margins. "
+    "Start with list_documents, then read the most relevant document."
+)
+
+
+def build_prompt(evidence: dict[str, Any]) -> str:
+    """Adjudication prompt: figures, rules and claims, but never my verdicts."""
+    rules = "\n".join(f"Point {p} - {RULES[p]['name']}: {RULES[p]['text']}" for p in CHOSEN_POINTS)
+    keys = ", ".join(f'"p{p}"' for p in CHOSEN_POINTS)
+    narrative = evidence.get("narrative") or "(no document was read)"
+    return (
+        f"Company: {evidence.get('company')} (industry: {evidence.get('industry')})\n\n"
+        f"Computed figures (amounts in USD thousands):\n{metrics_table(evidence)}\n\n"
+        f"Rules to apply, verbatim:\n{rules}\n\n"
+        f"What management claims (document excerpt, not evidence):\n"
+        f'"""\n{narrative}\n"""\n\n'
+        "Reply with a single JSON object and nothing else, in this shape:\n"
+        '{"points": {"1": {"verdict": "PASS or FAIL", "reason": "one sentence quoting the '
+        'figures you compared"}, ...}, "claims_check": "one sentence on whether the claims match '
+        'the figures", "summary": "two or three sentences explaining the verdicts"}\n'
+        f"Use exactly these keys under points: {keys}."
+    )
+
+
+def extract_json(text: str) -> dict[str, Any]:
+    """Pull the first JSON object out of a model reply, braces balanced."""
+    start = text.find("{")
+    while start != -1:
+        depth, in_string, escaped = 0, False, False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        loaded = json.loads(text[start:index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(loaded, dict):
+                        return loaded
+                    break
+        start = text.find("{", start + 1)
+    return {}
+
+
+def read_verdicts(payload: dict[str, Any]) -> dict[int, str | None]:
+    """Pull PASS/FAIL for each chosen point out of the reply."""
+    nested = payload.get("points") if isinstance(payload.get("points"), dict) else {}
+    out: dict[int, str | None] = {}
+    for point in CHOSEN_POINTS:
+        candidates = [nested.get(str(point)), nested.get(f"p{point}"),
+                      payload.get(str(point)), payload.get(f"p{point}")]
+        verdict = None
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                candidate = candidate.get("verdict")
+            if isinstance(candidate, str) and candidate.strip().upper() in VERDICTS:
+                verdict = candidate.strip().upper()
+                break
+        out[point] = verdict
+    return out
+
+
+@dataclass
+class FisherAgent:
+    """What build_agent() returns: the model and the adjudication chain."""
+    model: Any = None
+    analyst: Any = None
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
-
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
-
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
+    """Create the DeepSeek model and the prompt chain once."""
     ### YOUR CODE HERE
-    return None
+    try:
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_deepseek import ChatDeepSeek
+    except Exception as exc:  # pragma: no cover - dependency missing
+        print(f"[agent] LangChain unavailable ({exc}); verifier only", file=sys.stderr)
+        return FisherAgent()
+
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        print("[agent] DEEPSEEK_API_KEY is not set; verifier only", file=sys.stderr)
+        return FisherAgent()
+
+    try:
+        model = ChatDeepSeek(model=MODEL_NAME, temperature=0, timeout=120, max_retries=2)
+    except Exception as exc:  # pragma: no cover - bad key or bad client
+        print(f"[agent] could not build {MODEL_NAME} ({exc}); verifier only", file=sys.stderr)
+        return FisherAgent()
+
+    # No with_structured_output(): this model runs in thinking mode and rejects
+    # a forced tool_choice, so the reply is plain JSON that we parse ourselves.
+    prompt = ChatPromptTemplate.from_messages([("system", SYSTEM_PROMPT), ("human", "{prompt}")])
+    return FisherAgent(model=model, analyst=prompt | model)
+
+
+async def scout_claims(agent: FisherAgent, tools: list[Any]) -> str:
+    """Step 2: a small tool-calling agent reads the documents and quotes claims."""
+    from langchain.agents import create_agent
+
+    scout = create_agent(
+        agent.model,
+        tools=[find_tool(tools, "list_documents", 0), find_tool(tools, "read_document", 1)],
+        system_prompt=SCOUT_SYSTEM,
+    )
+    result = await asyncio.wait_for(
+        scout.ainvoke({"messages": [{"role": "user", "content": SCOUT_TASK}]},
+                      config={"recursion_limit": 8}),
+        timeout=SCOUT_TIMEOUT,
+    )
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not messages:
+        return ""
+    return str(getattr(messages[-1], "content", "")).strip()[:1200]
+
+
+async def gather_company(agent: FisherAgent, tools: list[Any]) -> dict[str, Any]:
+    """Steps 2-4: use the tools, then compute every figure in Python."""
+    sql_query = find_tool(tools, "sql_query", 2)
+    rows_context = parse_table(await call_tool(sql_query, {"query": SQL_CONTEXT}))
+    rows_revenue = parse_table(await call_tool(sql_query, {"query": SQL_REVENUE}))
+    rows_costs = parse_table(await call_tool(sql_query, {"query": SQL_COSTS}))
+    evidence = build_evidence(rows_context, rows_revenue, rows_costs)
+
+    if getattr(agent, "model", None) is not None:
+        try:
+            evidence["narrative"] = await scout_claims(agent, tools)
+        except Exception as exc:
+            print(f"[scout] failed ({exc}); reading the annual letter directly", file=sys.stderr)
+    if not evidence["narrative"]:
+        try:
+            text = await call_tool(find_tool(tools, "read_document", 1), {"name": ANNUAL_LETTER})
+            if not text.startswith("No document named"):
+                evidence["narrative"] = text[:2200]
+        except Exception:
+            pass
+    return evidence
+
+
+async def analyse_one(agent: FisherAgent, name: str, tools: list[Any]) -> dict[str, Any]:
+    """Run the pipeline for one company and never raise."""
+    evidence: dict[str, Any] = {"company": name, "industry": "unknown"}
+    try:
+        evidence = await gather_company(agent, tools)
+    except Exception as exc:
+        print(f"[{name}] tool failure: {exc}", file=sys.stderr)
+
+    verified = apply_rules(evidence)                      # step 6, from the figures
+    verdicts = {point: item["verdict"] for point, item in verified.items()}
+    summary = template_summary(evidence, verified)
+
+    if getattr(agent, "analyst", None) is not None:
+        try:
+            reply = await agent.analyst.ainvoke({"prompt": build_prompt(evidence)})
+            payload = extract_json(str(getattr(reply, "content", reply)))
+            judged = read_verdicts(payload)
+            covered = sum(value is not None for value in judged.values())
+            agree = sum(judged[point] == verdicts[point] for point in CHOSEN_POINTS
+                        if judged.get(point) is not None)
+            AGREEMENT["covered"] += covered
+            AGREEMENT["agree"] += agree
+            print(f"[{name}] adjudicator agreed {agree}/{covered} with the verifier", file=sys.stderr)
+
+            if covered == len(CHOSEN_POINTS) and agree == covered:
+                text = str(payload.get("summary") or payload.get("claims_check") or "").strip()
+                if len(text) > 40:
+                    summary = text
+            elif covered:
+                flags = ", ".join(str(point) for point in CHOSEN_POINTS
+                                  if judged.get(point) != verdicts[point])
+                print(f"[{name}] verifier overrode the adjudicator on: {flags}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[{name}] adjudicator failed ({exc}); keeping the verified figures", file=sys.stderr)
+
+    return {"points": verdicts, "summary": summary}
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
-
-    ``companies`` maps each company folder name to its four LangChain tools:
-
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
-
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
-
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
-
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
-        }
-
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
-
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
-    """
+    """Run the agent on every company, in parallel, without raising."""
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(MAX_PARALLEL)
+    results: dict[str, dict[str, Any]] = {}
+
+    async def worker(name: str, tools: list[Any]) -> None:
+        async with semaphore:
+            try:
+                results[name] = await asyncio.wait_for(
+                    analyse_one(agent, name, tools), timeout=COMPANY_TIMEOUT
+                )
+            except Exception as exc:  # timeout or anything unexpected
+                print(f"[{name}] giving up ({exc})", file=sys.stderr)
+                results[name] = {"points": {}, "summary": f"Analysis failed: {exc}"}
+            print(f"[{name}] done ({len(results)}/{len(companies)})", file=sys.stderr)
+
+    await asyncio.gather(*(worker(name, tools) for name, tools in companies.items()))
+    if AGREEMENT["covered"]:
+        print(f"[agent] adjudicator vs verifier: {AGREEMENT['agree']}/{AGREEMENT['covered']} "
+              "verdicts agreed", file=sys.stderr)
+    return results
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
